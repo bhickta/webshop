@@ -1,0 +1,43 @@
+name: PR Agent (Gemini)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr_agent_job:
+    if: >-
+      github.event.sender.type != 'Bot' &&
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request)
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+      contents: read
+    steps:
+      - name: PR Agent action step
+        uses: qodo-ai/pr-agent@8e4d32e5497defd43c023a404f73560c62728961
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          config.model: "gemini/gemini-2.5-flash"
+          config.fallback_models: '["gemini/gemini-2.5-flash"]'
+          config.custom_model_max_tokens: "1000000"
+          GOOGLE_AI_STUDIO.GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          github_action_config.auto_review: "true"
+          github_action_config.auto_describe: "true"
+          github_action_config.auto_improve: "true"
+          pr_reviewer.extra_instructions: >-
+            Review behavior and data integrity before style. Flag accounting, stock,
+            permission, authentication, SQL, migration, background-job, and transaction
+            risks. Require concrete test evidence for functional changes. Flag unrelated
+            files, generated noise, dead code, and unnecessary formatting. Do not claim
+            a PR is safe merely because syntax is valid.
+          pr_code_suggestions.extra_instructions: >-
+            Suggest only actionable fixes grounded in changed lines. Prioritize correctness,
+            security, data integrity, backward compatibility, and tests over cosmetic edits.

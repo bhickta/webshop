@@ -1,0 +1,120 @@
+name: Deploy Webshop
+
+on:
+  push:
+    branches:
+      - production
+      - develop
+
+env:
+  CODEDEPLOY_APP_NAME: RaplBaddi-App
+  CD_GROUP_PROD:       Rapl-Prod-Group
+  CD_GROUP_DEV:        Rapl-Dev-Group
+  S3_FOLDER_PREFIX:    webshop
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Analyze Commit Flags
+        id: flags
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          echo "Commit Message: $COMMIT_MSG"
+
+          SKIP_BUILD="false"
+          SKIP_MIGRATE="false"
+          SKIP_RESTART="false"
+
+          if [[ "$COMMIT_MSG" == *"[skip build]"* ]]; then SKIP_BUILD="true"; fi
+          if [[ "$COMMIT_MSG" == *"[skip migrate]"* ]]; then SKIP_MIGRATE="true"; fi
+          if [[ "$COMMIT_MSG" == *"[skip restart]"* ]]; then SKIP_RESTART="true"; fi
+
+          if [[ "$COMMIT_MSG" == *"[restart only]"* ]]; then
+            SKIP_BUILD="true"
+            SKIP_MIGRATE="true"
+            SKIP_RESTART="false"
+          fi
+
+          echo "export SKIP_BUILD=$SKIP_BUILD" > .deploy_config
+          echo "export SKIP_MIGRATE=$SKIP_MIGRATE" >> .deploy_config
+          echo "export SKIP_RESTART=$SKIP_RESTART" >> .deploy_config
+
+          cat .deploy_config
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Determine Deployment Group
+        id: target
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/production" ]]; then
+            echo "group_name=${{ env.CD_GROUP_PROD }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            echo "group_name=${{ env.CD_GROUP_DEV }}" >> $GITHUB_OUTPUT
+          else
+            echo "Unknown branch for deployment"
+            exit 1
+          fi
+
+      - name: Zip Application
+        run: |
+          zip -r deploy.zip . -x "*.git*" -x "node_modules/*" -x "GIT_WORKFLOW.md" -x "documentations/*"
+
+      - name: Push to S3
+        run: |
+          aws s3 cp deploy.zip s3://${{ secrets.S3_BUCKET_NAME }}/${{ env.S3_FOLDER_PREFIX }}/${{ github.sha }}.zip
+
+      - name: Trigger CodeDeploy
+        run: |
+          deployment_id=""
+          for attempt in $(seq 1 30); do
+            set +e
+            output=$(aws deploy create-deployment \
+              --application-name ${{ env.CODEDEPLOY_APP_NAME }} \
+              --deployment-group-name ${{ steps.target.outputs.group_name }} \
+              --s3-location bucket=${{ secrets.S3_BUCKET_NAME }},key=${{ env.S3_FOLDER_PREFIX }}/${{ github.sha }}.zip,bundleType=zip \
+              --description "Webshop artifact deploy ${{ github.sha }}" \
+              --auto-rollback-configuration enabled=true,events=DEPLOYMENT_FAILURE \
+              --query deploymentId \
+              --output text 2>&1)
+            command_status=$?
+            set -e
+
+            if [ "$command_status" -eq 0 ]; then
+              deployment_id="$output"
+              break
+            fi
+
+            if [[ "$output" != *"DeploymentLimitExceededException"* ]]; then
+              echo "$output"
+              exit "$command_status"
+            fi
+
+            echo "Another deployment is active; retrying in 20 seconds (${attempt}/30)"
+            sleep 20
+          done
+
+          if [ -z "$deployment_id" ]; then
+            echo "CodeDeploy remained busy for 10 minutes"
+            exit 1
+          fi
+
+          echo "CodeDeploy accepted deployment ${deployment_id}; lifecycle hooks enforce migration and restart success."
